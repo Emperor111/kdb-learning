@@ -1,124 +1,113 @@
-/ =========================================================
-/ KDB+ RTE PoC: VWAP + ALL Transformations
-/ =========================================================
+/ tick/rte.q
+/ Usage: q tick/rte.q -p 5014
 
-/ *** 1. Configuration ***
-TP_HOST: `::      / Localhost
-TP_PORT: 5010     / Port for the Tickerplant
+\d .rte
 
-/ *** 2. Data Storage (In-Memory) ***
+/ --- Configuration ---
+TP_PORT:5010;
 
-/ Log table for raw data (requires 'date' to satisfy the new functions)
-trade_log: ([] date:`date$(); time:`time$(); sym:`symbol$(); price:`float$(); size:`long$())
-
-/ Running aggregation state for VWAP
-vwap_agg: ([] sym:`$(); sum_pv:0n; sum_v:0n)
+/ --- Schema Definitions ---
+trade_log:([]date:`date$();time:`timespan$();sym:`symbol$();price:`float$();size:`long$();side:`symbol$());
+vwap_agg:([sym:`symbol$()] sum_pv:`float$(); sum_v:`long$(); vwap:`float$());
 
 / =========================================================
-/ *** 3. Transformation Functions (All Screenshots) ***
+/ *** 3. Transformation Functions ***
 / =========================================================
 
-/ Function: getFilledTab (NEWLY ADDED)
-/ Purpose: Fills null values forward for specified columns, filtered by a single date (dt) and symbol (s).
+/ Function: getFilledTab
 getFilledTab:{[tab;s;dt;col]
     col:(),col;
-    
-    / Create the fills clause (applies 'fills' to each column)
     colClause:col!fills,'col;
-    
-    / 1. Select data matching a SINGLE date (dt) and sym
     tab:?[tab;
         ((=;`date;dt); $[`~s;1b;(in;`sym;(),s)]);
         0b;
         {x!x} `date`time`sym union (),col
     ];
-
-    / 2. Update with forward fill by symbol
     ![tab;();(enlist `sym)!enlist `sym;colClause]
  };
 
-/ Function: FilledTab (Previously provided)
-/ Purpose: Similar to getFilledTab but accepts multiple datetimes for date filtering.
+/ Function: FilledTab
 FilledTab:{[tab;s;datetimes;col]
     col:(),col;
     datetimes:(),datetimes;
     colClause:col!fills,'col;
-    
-    / 1. Select data matching MULTIPLE dates (in;`date;datetimes) and sym
     tab:?[tab;
         ((in;`date;datetimes); $[`~s;1b;(in;`sym;(),s)]);
         0b;
         {x!x} `date`time`sym union (),col
     ];
-
-    / 2. Update with forward fill by symbol
     ![tab;();(enlist `sym)!enlist `sym;colClause]
  };
 
-/ Function: strikeAsOf (Previously provided)
-/ Purpose: Returns data as of specific datetimes using bucket join (bin).
+/ Function: strikeAsOf
+/ Purpose: Returns data as of specific datetimes using bucket join (bin)
 strikeAsOf:{[tab;s;datetimes;col]
     datelist:distinct `date$datetimes;
     col:$[`~col;cols tab;col];
     col:`time union col;
     symClause:$[`~s;1b;(in;`sym;(),s)];
     
-    / Use FilledTab to retrieve and fill the base data
-    tab:FilledTab[tab;s;datelist;col];
+    / 1. Fill base data
+    tab:.rte.FilledTab[tab;s;datelist;col];
 
-    / Create date_time column for the binary search
+    / 2. Prepare columns for AsOf Join
     tab:update date_time:date+time from tab;
     col:`date_time union col except `time;
     T:`s# asc datetimes;
     
-    / Perform the As-Of Logic using bin
+    / 3. Perform As-Of Logic (Functional Select)
+    / Syntax Fix: Nested (not; (>...)) correctly
     res:?[tab;
-        (symClause;((;not;>);`date_time;(max;T)));
-        `sym`timebucket!(`sym;(T;(+;1;(bin;T;`date_time))));
-        col!((last;x)) each col
+       (symClause; (not; (>; `date_time; (max; T))) );
+       `sym`timebucket!(`sym; (T; (bin; T; `date_time)) );
+       col!{(last;x)} each col
     ];
     
     res
  };
 
 / =========================================================
-/ *** 4. Real-Time Engine Logic (RTE) ***
+/ *** End Transformations ***
 / =========================================================
 
-/ Connection Initialization
-.rte.init:{
-    0N!`"Connecting to Tickerplant at ", string[TP_PORT], "...";
-    h: hopen (TP_HOST; TP_PORT);
-    neg[h] (`.u.sub; `trade; ``; `.rte.reset);
-    .u.upd: .rte.upd;
-    0N!`"RTE Ready. Listening for updates...";
+/ --- Update Logic ---
+upd:{[t;x]
+    if[not t=`trade;:()];
+    
+    / Normalize Data
+    data:$[98h=type x; x; 0h=type x; [colsVal:$[4<count x; -4#x; x]; flip `time`sym`price`side!colsVal]; flip `time`sym`price`side!x];
+
+    / Augment & Insert
+    data:update date:.z.d, size:100j from data;
+    `trade_log insert select date, time, sym, price, size, side from data;
+
+    / VWAP Calc
+    batch:select sum_pv:sum price*size, sum_v:sum size by sym from data;
+    .rte.vwap_agg+:batch;
+    update vwap:sum_pv%sum_v from `.rte.vwap_agg;
+
+    / Clean Print
+    /-1 "VWAP UPDATE @ ",string[.z.p]," : ", .Q.s1 select sym, vwap from .rte.vwap_agg;
+    -1 "VWAP UPDATE @ ",string[.z.p];
+    show select sym, vwap from .rte.vwap_agg;
+    -1 "";
+ };
+
+/ --- Initialization ---
+init:{
+    -1 ">>> Initializing RTE...";
+    h:@[hopen;TP_PORT;{-1 "!!! ERROR: Connection failed: ",x; 0i}];
+    if[h=0i; -1 ">>> Running in offline mode."; :()];
+    neg[h]"(.u.sub[`trade;`])";
+    -1 ">>> RTE Ready and Subscribed.";
     h
  };
 
-/ The Reset Function
-.rte.reset:{[tab; x]
-    trade_log:: delete from trade_log;
-    vwap_agg:: ([] sym:`$(); sum_pv:0n; sum_v:0n);
- };
+/ --- GLOBAL MAPPINGS ---
+\d .
+upd:.rte.upd;
+.u.upd:.rte.upd;
+.q.upd:.rte.upd;
 
-/ The Update Function (Called on every tick)
-.rte.upd:{[tab; x]
-    if[not tab=`trade; :()];
-
-    / --- A. Data Persistence for Transformations ---
-    / We inject today's date (.z.d) as the transformation functions require a 'date' column
-    x_with_date: update date:.z.d from x;
-    `trade_log insert x_with_date;
-
-    / --- B. Real-Time VWAP Analytics ---
-    x: update pv:price * size from x;
-    new_agg: select sum_pv:sum pv, sum_v:sum size by sym from x;
-    vwap_agg:: .[vwap_agg; (); upsert; new_agg];
-    result: update vwap: sum_pv % sum_v from vwap_agg;
-    
-    0N!(`VWAP_LATEST; .z.p; result);
- };
-
-/ *** 5. Startup ***
+/ --- EXECUTE ---
 .rte.init[];
-\
